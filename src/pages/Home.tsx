@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState, useEffect, useCallback } from 'react';
 import {
   DndContext,
   closestCenter,
@@ -18,16 +18,56 @@ import KanbanColumn from '../components/KanbanColumn';
 import ProgressStats from '../components/ProgressStats';
 import FilterBar from '../components/FilterBar';
 import RoleSwitcher from '../components/RoleSwitcher';
-import { LayoutDashboard } from 'lucide-react';
+import TaskHistoryPanel from '../components/TaskHistoryPanel';
+import { LayoutDashboard, Undo2, Redo2, History } from 'lucide-react';
 
 export default function Home() {
+  const [showHistory, setShowHistory] = useState(false);
+
   const {
     getTasksByStatus,
     getFilteredTasks,
     moveTask,
     reorderTask,
     getCurrentRole,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
   } = useTaskStore();
+
+  const handleUndo = useCallback(() => {
+    const success = undo();
+    if (!success) {
+      console.log('没有可撤销的操作');
+    }
+  }, [undo]);
+
+  const handleRedo = useCallback(() => {
+    const success = redo();
+    if (!success) {
+      console.log('没有可恢复的操作');
+    }
+  }, [redo]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      }
+      if (
+        ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'z') ||
+        ((e.metaKey || e.ctrlKey) && e.key === 'y')
+      ) {
+        e.preventDefault();
+        handleRedo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleUndo, handleRedo]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -47,7 +87,7 @@ export default function Home() {
     return task?.status || null;
   };
 
-  const handleDragStart = (event: DragStartEvent) => {
+  const handleDragStart = (_event: DragStartEvent) => {
     //
   };
 
@@ -112,8 +152,39 @@ export default function Home() {
                 <p className="text-xs text-slate-500">Exhibition Progress Dashboard</p>
               </div>
             </div>
-            <div className="text-sm text-slate-500">
-              数据自动保存到本地，支持离线使用
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleUndo}
+                disabled={!canUndo()}
+                className="flex items-center gap-1 px-3 py-1.5 text-sm text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                data-testid="undo-btn"
+                title="撤销 (Ctrl+Z)"
+              >
+                <Undo2 size={16} />
+                <span className="hidden sm:inline">撤销</span>
+              </button>
+              <button
+                onClick={handleRedo}
+                disabled={!canRedo()}
+                className="flex items-center gap-1 px-3 py-1.5 text-sm text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                data-testid="redo-btn"
+                title="恢复 (Ctrl+Shift+Z / Ctrl+Y)"
+              >
+                <Redo2 size={16} />
+                <span className="hidden sm:inline">恢复</span>
+              </button>
+              <div className="w-px h-6 bg-slate-200 mx-1"></div>
+              <button
+                onClick={() => setShowHistory(true)}
+                className="flex items-center gap-1 px-3 py-1.5 text-sm text-blue-600 bg-blue-50 rounded-lg hover:bg-blue-100 transition-colors"
+                data-testid="history-btn"
+              >
+                <History size={16} />
+                <span className="hidden sm:inline">操作历史</span>
+              </button>
+              <div className="text-sm text-slate-500 ml-2 hidden md:block">
+                数据自动保存到本地，支持离线使用
+              </div>
             </div>
           </div>
         </div>
@@ -153,9 +224,13 @@ export default function Home() {
             <li>• <strong>角色差异</strong>：切换右上角身份可查看不同角色的权限和可见内容</li>
             <li>• <strong>离线保存</strong>：所有操作自动保存到浏览器本地存储，刷新后数据保留</li>
             <li>• <strong>风险筛选</strong>：使用顶部筛选器按展区、风险等级、负责人筛选任务</li>
+            <li>• <strong>撤销恢复</strong>：点击顶部撤销/恢复按钮，或使用快捷键 Ctrl+Z / Ctrl+Shift+Z</li>
+            <li>• <strong>操作历史</strong>：点击"操作历史"查看所有展区任务的详细变更记录</li>
           </ul>
         </div>
       </main>
+
+      <TaskHistoryPanel isOpen={showHistory} onClose={() => setShowHistory(false)} />
     </div>
   );
 }

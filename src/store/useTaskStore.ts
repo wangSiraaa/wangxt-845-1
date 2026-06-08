@@ -1,7 +1,21 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { ExhibitionTask, TaskStatus, TaskFilters, UserRole, TaskPhoto, AcceptanceError, RiskLevel } from '../types';
+import {
+  ExhibitionTask,
+  TaskStatus,
+  TaskFilters,
+  UserRole,
+  TaskPhoto,
+  AcceptanceError,
+  RiskLevel,
+  TaskHistory,
+  HistoryActionType,
+  HistorySnapshot,
+} from '../types';
 import { SEED_TASKS, USERS, ROLE_PERMISSIONS } from '../data/seed';
+import { generateId } from '../utils/taskUtils';
+
+const MAX_UNDO_STACK = 50;
 
 interface TaskStore {
   tasks: ExhibitionTask[];
@@ -9,6 +23,9 @@ interface TaskStore {
   filters: TaskFilters;
   lastSynced: string | null;
   isOffline: boolean;
+  undoStack: HistorySnapshot[];
+  redoStack: HistorySnapshot[];
+  taskHistory: TaskHistory[];
   setCurrentUser: (userId: string) => void;
   getCurrentUser: () => typeof USERS[0] | undefined;
   getCurrentRole: () => UserRole;
@@ -26,6 +43,12 @@ interface TaskStore {
   addPhoto: (taskId: string, photo: Omit<TaskPhoto, 'id'>) => void;
   removePhoto: (taskId: string, photoId: string) => void;
   updateTask: (taskId: string, updates: Partial<ExhibitionTask>) => void;
+  undo: () => boolean;
+  redo: () => boolean;
+  canUndo: () => boolean;
+  canRedo: () => boolean;
+  getTaskHistory: () => TaskHistory[];
+  getHistoryByZone: (zoneId: string) => TaskHistory[];
   getProgressStats: () => {
     total: number;
     done: number;
@@ -55,6 +78,9 @@ export const useTaskStore = create<TaskStore>()(
       },
       lastSynced: new Date().toISOString(),
       isOffline: false,
+      undoStack: [],
+      redoStack: [],
+      taskHistory: [],
 
       setCurrentUser: (userId) => set({ currentUserId: userId }),
 
@@ -121,8 +147,19 @@ export const useTaskStore = create<TaskStore>()(
         }),
 
       moveTask: (taskId, newStatus, newOrder) => {
-        set((state) => {
-          const tasks = state.tasks.map((t) => {
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return;
+        const oldStatus = task.status;
+        if (oldStatus === newStatus) return;
+
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => {
+          const tasks = s.tasks.map((t) => {
             if (t.id === taskId) {
               return {
                 ...t,
@@ -136,20 +173,44 @@ export const useTaskStore = create<TaskStore>()(
             }
             return t;
           });
-          return { tasks, lastSynced: new Date().toISOString() };
+
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'move_task',
+            previousState: { status: oldStatus, order: task.order },
+            nextState: { status: newStatus, order: newOrder },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: `任务从"${oldStatus}"移动到"${newStatus}"`,
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
         });
       },
 
       reorderTask: (taskId, newOrder, status) => {
-        set((state) => {
-          const tasks = [...state.tasks];
-          const taskIndex = tasks.findIndex((t) => t.id === taskId);
-          if (taskIndex === -1) return state;
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return;
+        const oldOrder = task.order;
+        if (oldOrder === newOrder) return;
 
-          const task = tasks[taskIndex];
-          const oldOrder = task.order;
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
 
-          if (oldOrder === newOrder) return state;
+        set((s) => {
+          const tasks = [...s.tasks];
 
           tasks.forEach((t) => {
             if (t.id === taskId) {
@@ -164,7 +225,26 @@ export const useTaskStore = create<TaskStore>()(
             }
           });
 
-          return { tasks, lastSynced: new Date().toISOString() };
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'reorder_task',
+            previousState: { order: oldOrder },
+            nextState: { order: newOrder },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: `任务排序从第${oldOrder + 1}位调整到第${newOrder + 1}位`,
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
         });
       },
 
@@ -211,52 +291,151 @@ export const useTaskStore = create<TaskStore>()(
           return { success: false, error };
         }
 
-        set((state) => ({
-          tasks: state.tasks.map((t) =>
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return { success: false };
+
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => {
+          const tasks = s.tasks.map((t) =>
             t.id === taskId
-              ? { ...t, status: 'done', updatedAt: new Date().toISOString() }
+              ? { ...t, status: 'done' as const, updatedAt: new Date().toISOString() }
               : t
-          ),
-          lastSynced: new Date().toISOString(),
-        }));
+          );
+
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'accept_task',
+            previousState: { status: task.status },
+            nextState: { status: 'done' as const },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: '任务验收通过，标记为已完成',
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
+        });
 
         return { success: true };
       },
 
       rejectTask: (taskId, reason) => {
-        set((state) => ({
-          tasks: state.tasks.map((t) =>
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return;
+
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => {
+          const tasks = s.tasks.map((t) =>
             t.id === taskId
               ? {
                   ...t,
-                  status: 'in_progress',
+                  status: 'in_progress' as const,
                   notes: reason,
                   updatedAt: new Date().toISOString(),
                 }
               : t
-          ),
-          lastSynced: new Date().toISOString(),
-        }));
+          );
+
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'reject_task',
+            previousState: { status: task.status, notes: task.notes },
+            nextState: { status: 'in_progress' as const, notes: reason },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: `任务被驳回，原因：${reason}`,
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
+        });
       },
 
       addPhoto: (taskId, photo) => {
-        set((state) => ({
-          tasks: state.tasks.map((t) =>
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return;
+
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => {
+          const newPhoto = { ...photo, id: `photo-${Date.now()}` };
+          const tasks = s.tasks.map((t) =>
             t.id === taskId
               ? {
                   ...t,
-                  photos: [...t.photos, { ...photo, id: `photo-${Date.now()}` }],
+                  photos: [...t.photos, newPhoto],
                   updatedAt: new Date().toISOString(),
                 }
               : t
-          ),
-          lastSynced: new Date().toISOString(),
-        }));
+          );
+
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'add_photo',
+            previousState: { photos: [...task.photos] },
+            nextState: { photos: [...task.photos, newPhoto] },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: `上传布展照片（共${task.photos.length + 1}张）`,
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
+        });
       },
 
       removePhoto: (taskId, photoId) => {
-        set((state) => ({
-          tasks: state.tasks.map((t) =>
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return;
+        const photoToRemove = task.photos.find((p) => p.id === photoId);
+        if (!photoToRemove) return;
+
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => {
+          const tasks = s.tasks.map((t) =>
             t.id === taskId
               ? {
                   ...t,
@@ -264,21 +443,121 @@ export const useTaskStore = create<TaskStore>()(
                   updatedAt: new Date().toISOString(),
                 }
               : t
-          ),
-          lastSynced: new Date().toISOString(),
-        }));
+          );
+
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'remove_photo',
+            previousState: { photos: [...task.photos] },
+            nextState: { photos: task.photos.filter((p) => p.id !== photoId) },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: `删除照片（剩余${task.photos.length - 1}张）`,
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
+        });
       },
 
       updateTask: (taskId, updates) => {
-        set((state) => ({
-          tasks: state.tasks.map((t) =>
+        const state = get();
+        const task = state.tasks.find((t) => t.id === taskId);
+        if (!task) return;
+
+        const snapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => {
+          const tasks = s.tasks.map((t) =>
             t.id === taskId
               ? { ...t, ...updates, updatedAt: new Date().toISOString() }
               : t
-          ),
+          );
+
+          const updateKeys = Object.keys(updates).join('、');
+          const historyEntry: TaskHistory = {
+            id: generateId(),
+            taskId,
+            taskTitle: task.title,
+            zone: task.zone,
+            action: 'update_task',
+            previousState: { ...task },
+            nextState: { ...task, ...updates },
+            performedBy: s.currentUserId,
+            performedAt: new Date().toISOString(),
+            description: `更新任务属性：${updateKeys}`,
+          };
+
+          return {
+            tasks,
+            taskHistory: [historyEntry, ...s.taskHistory].slice(0, 200),
+            undoStack: [...s.undoStack, snapshot].slice(-MAX_UNDO_STACK),
+            redoStack: [],
+            lastSynced: new Date().toISOString(),
+          };
+        });
+      },
+
+      undo: () => {
+        const state = get();
+        if (state.undoStack.length === 0) return false;
+
+        const snapshot = state.undoStack[state.undoStack.length - 1];
+        const currentSnapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => ({
+          tasks: snapshot.tasks,
+          taskHistory: snapshot.history,
+          undoStack: s.undoStack.slice(0, -1),
+          redoStack: [...s.redoStack, currentSnapshot].slice(-MAX_UNDO_STACK),
           lastSynced: new Date().toISOString(),
         }));
+
+        return true;
       },
+
+      redo: () => {
+        const state = get();
+        if (state.redoStack.length === 0) return false;
+
+        const snapshot = state.redoStack[state.redoStack.length - 1];
+        const currentSnapshot: HistorySnapshot = {
+          tasks: JSON.parse(JSON.stringify(state.tasks)),
+          history: JSON.parse(JSON.stringify(state.taskHistory)),
+        };
+
+        set((s) => ({
+          tasks: snapshot.tasks,
+          taskHistory: snapshot.history,
+          redoStack: s.redoStack.slice(0, -1),
+          undoStack: [...s.undoStack, currentSnapshot].slice(-MAX_UNDO_STACK),
+          lastSynced: new Date().toISOString(),
+        }));
+
+        return true;
+      },
+
+      canUndo: () => get().undoStack.length > 0,
+      canRedo: () => get().redoStack.length > 0,
+
+      getTaskHistory: () => get().taskHistory,
+
+      getHistoryByZone: (zoneId) =>
+        get().taskHistory.filter((h) => h.zone === zoneId),
 
       getProgressStats: () => {
         const tasks = get().getVisibleTasks();
@@ -324,6 +603,9 @@ export const useTaskStore = create<TaskStore>()(
         currentUserId: state.currentUserId,
         filters: state.filters,
         lastSynced: state.lastSynced,
+        undoStack: state.undoStack,
+        redoStack: state.redoStack,
+        taskHistory: state.taskHistory,
       }),
     }
   )
